@@ -1,7 +1,8 @@
 """Static tool governance: ``toolsof`` / ``reachable_tools`` / ``check_tools`` — no LLM call.
 
 These check the static tool graph: which tools a template, or a function that calls one,
-can reach — computed by reading ``.tools`` and by reifying to a Term, never running the LLM.
+can reach — computed by reading captured lexical scope and by reifying to a Term, never
+running the LLM.
 """
 
 from effectful.handlers.llm.completions import LexicalReaders
@@ -71,31 +72,40 @@ def test_reachable_tools_is_the_leak_check():
     assert leak == frozenset({delete_everything})  # flagged, LLM never called
 
 
-def test_governed_tool_graph_excludes_synthetic_lexical_readers():
-    # Synthetic LexicalReaders tools are prompt-variable plumbing, not tools an agent
-    # reaches. Law: the governed tool graph is invariant to whether readers are exposed —
-    # so a plain lexical value never gets counted as a reachable tool (and thus never
-    # flagged as a leak).
+def test_tool_graph_counts_only_real_tools_not_handler_capabilities():
+    # Governance counts only the real Tool/Template instances a template captures in its
+    # lexical scope. Handler-injected capabilities (LexicalReaders' synthetic readers, a
+    # final tool, a code-exec tool) are `tool_types` assembled at `call_system` time, never
+    # in scope, so they never enter the graph. Law: `toolsof` is invariant to whether such a
+    # handler is installed, and a plain lexical value never becomes a reachable tool.
     @Tool.define
     def real_tool() -> int:
         """A real tool."""
         return 0
 
-    favorite_city = "Paris"  # a plain lexical value -> becomes a synthetic reader
+    favorite_city = (
+        "Paris"  # a plain lexical value the LLM could read via a synthetic tool
+    )
 
     @Template.define
     def t() -> str:
         """Use {favorite_city} with the real_tool."""
         raise NotImplementedError
 
-    baseline = toolsof(t)  # no readers exposed
+    assert (
+        t.__context__["favorite_city"] == favorite_city
+    )  # the plain value IS in scope...
+
+    baseline = toolsof(t)
     with handler(LexicalReaders()):
-        # guard: a synthetic reader really was created, snapshotting the lexical value
-        assert t.tools["favorite_city"]() == favorite_city
         with_readers = toolsof(t)
 
-    assert real_tool in baseline
-    assert with_readers == baseline  # readers do not enter the governed graph
+    assert baseline == frozenset(
+        {real_tool}
+    )  # ...but is not counted as a reachable tool
+    assert (
+        with_readers == baseline
+    )  # installing LexicalReaders does not change the graph
 
 
 def test_check_tools_flags_the_leak():

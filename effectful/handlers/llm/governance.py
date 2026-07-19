@@ -5,12 +5,17 @@ A :class:`~effectful.handlers.llm.template.Tool` **is** an
 ``class Template(Tool)``), so a template's tools *are* part of its effect row. These
 compute the tool graph without ever calling the LLM:
 
-* :func:`toolsof` — the transitive tool graph reachable from a tool/template via ``.tools``.
-  Fully static: it reads lexically-captured ``.tools`` mappings, nothing is executed.
+* :func:`toolsof` — the tools transitively reachable from a tool/template through the
+  lexical scope it captured, via :func:`~effectful.handlers.llm.completions._tools_in_scope`.
+  Fully static: it reads captured lexical contexts, nothing is executed.
 * :func:`reachable_tools` — the tools a zero-arg function can reach, *through* templates,
   by reifying it to a :class:`~effectful.ops.types.Term` (never running the LLM or any
   tool body) and walking it for the tools it mentions, then expanding via :func:`toolsof`.
 * :func:`check_tools` — the leak check ``reachable_tools(fn) - allowed``.
+
+Only real :class:`Tool` / :class:`Template` instances are in a template's lexical scope;
+synthetic lexical readers and other handler capabilities are injected as ``tool_types`` at
+``call_system`` time, not captured in scope, so they never appear in this graph.
 
 **Soundness precondition (important).** :func:`reachable_tools` obtains the term by
 *running ``fn``'s own Python body* under a reifying interpretation. Operation calls become
@@ -26,7 +31,7 @@ import collections.abc
 from collections.abc import Callable
 from typing import Any
 
-from effectful.handlers.llm.completions import _LexicalVariableTool
+from effectful.handlers.llm.completions import _tools_in_scope
 from effectful.handlers.llm.template import Tool
 from effectful.internals.runtime import interpreter
 from effectful.ops.semantics import apply
@@ -36,26 +41,16 @@ from effectful.ops.types import Term
 __all__ = ["toolsof", "reachable_tools", "check_tools"]
 
 
-def _is_governed(tool: Any) -> bool:
-    """A ``Tool`` the governance graph should count. Excludes synthetic
-    :class:`~effectful.handlers.llm.completions._LexicalVariableTool` readers — they are
-    prompt-variable plumbing auto-wrapped from lexical values by ``LexicalReaders``, not
-    tools an agent "reaches", so treating them as reachable would flag plumbing as a leak.
-    """
-    return isinstance(tool, Tool) and not isinstance(tool, _LexicalVariableTool)
-
-
 def _tools_in(term: Any) -> frozenset[Tool]:
-    """Every governed :class:`Tool` appearing *anywhere* in a reified ``term`` — as an
-    operation or as an argument. ``Tool`` / ``Template`` subclass
-    :class:`~effectful.ops.types.Operation` and define their own ``__apply__``, so a called
-    tool sits in the ``args`` of an ``apply`` node rather than being the node's ``op``; a
-    structural walk catches both. Synthetic lexical readers are excluded (:func:`_is_governed`).
+    """Every :class:`Tool` appearing *anywhere* in a reified ``term`` — as an operation or
+    as an argument. ``Tool`` / ``Template`` subclass :class:`~effectful.ops.types.Operation`
+    and define their own ``__apply__``, so a called tool sits in the ``args`` of an
+    ``apply`` node rather than being the node's ``op``; a structural walk catches both.
     """
     found: set[Tool] = set()
 
     def walk(x: Any) -> None:
-        if _is_governed(x):
+        if isinstance(x, Tool):
             found.add(x)
         if isinstance(x, Term):
             walk(x.op)
@@ -76,22 +71,28 @@ def _tools_in(term: Any) -> frozenset[Tool]:
 
 
 def toolsof(tool: Tool) -> frozenset[Tool]:
-    """The tools transitively reachable from ``tool`` through its ``.tools`` graph
+    """The tools transitively reachable from ``tool`` through the lexical scope it captured
     (a template's tools are themselves tools, so this closes over sub-agents too).
 
-    Fully static — it reads the lexically-captured ``.tools`` mapping, never calls the
-    LLM. ``tool`` itself is *not* included (it is the root, not something it reaches), and
-    synthetic lexical readers are excluded (:func:`_is_governed`).
+    Fully static — it reads each template's captured ``__context__`` via
+    :func:`~effectful.handlers.llm.completions._tools_in_scope`, never calls the LLM. A plain
+    :class:`Tool` captures no scope, so it is a leaf. ``tool`` itself is *not* included (it is
+    the root, not something it reaches) even though a template sees itself in its own scope.
     """
     seen: set[Tool] = set()
     stack: list[Tool] = [tool]
     while stack:
         cur = stack.pop()
-        for sub in getattr(cur, "tools", {}).values():
-            if _is_governed(sub) and sub not in seen:
+        context = getattr(
+            cur, "__context__", None
+        )  # only Templates capture lexical scope
+        if context is None:
+            continue
+        for sub in _tools_in_scope(context):
+            if sub not in seen:
                 seen.add(sub)
                 stack.append(sub)
-    return frozenset(seen)
+    return frozenset(seen) - {tool}  # exclude the root; a template sees itself in scope
 
 
 def reachable_tools(fn: Callable[[], Any]) -> frozenset[Tool]:
