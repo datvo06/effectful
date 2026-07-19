@@ -31,14 +31,14 @@ import collections.abc
 from collections.abc import Callable
 from typing import Any
 
-from effectful.handlers.llm.completions import _tools_in_scope
-from effectful.handlers.llm.template import Tool
+from effectful.handlers.llm.completions import _tools_in_scope, call_assistant
+from effectful.handlers.llm.template import Template, Tool
 from effectful.internals.runtime import interpreter
-from effectful.ops.semantics import apply
-from effectful.ops.syntax import defdata
+from effectful.ops.semantics import apply, fwd, handler
+from effectful.ops.syntax import ObjectInterpretation, Uses, defdata, implements
 from effectful.ops.types import Term
 
-__all__ = ["toolsof", "reachable_tools", "check_tools"]
+__all__ = ["toolsof", "reachable_tools", "check_tools", "RestrictTools"]
 
 
 def _tools_in(term: Any) -> frozenset[Tool]:
@@ -128,3 +128,44 @@ def check_tools(fn: Callable[[], Any], *allowed: Tool) -> frozenset[Tool]:
     ``reachable_tools(fn) - allowed``.
     """
     return reachable_tools(fn) - frozenset(allowed)
+
+
+class RestrictTools(ObjectInterpretation):
+    """Off-by-default handler enforcing a template's ``Uses[...]`` allow-list at run time.
+
+    When a :class:`~effectful.handlers.llm.template.Template` whose return type declares
+    ``Uses[tool, ...]`` is called, the LLM is offered *only* the declared tools: the
+    lexical tools reaching :func:`~effectful.handlers.llm.completions.call_assistant` are
+    intersected with the allow-list. A template with no ``Uses`` annotation is unrestricted,
+    so installing this handler is backward-compatible.
+
+    Enforcement is by construction and sound (no LLM introspection): an unlisted tool is
+    never *offered*, and the decode boundary rejects a call to a tool that was not offered,
+    so the model physically cannot invoke it. The restriction is scoped to the individual
+    ``Template.__apply__`` by a per-call handler on ``call_assistant`` — the effectful-native
+    pattern (a fresh handler whose dynamic extent is the call), so a template gets the
+    narrowed set only for its own completion.
+
+    Only real lexical tools are filtered; handler-injected capabilities (synthetic readers,
+    a final tool, a code-exec tool) are ``tool_types`` unioned in downstream and are left
+    untouched.
+    """
+
+    @implements(Template.__apply__)
+    def _restrict[**P, T](
+        self, template: Template[P, T], *args: P.args, **kwargs: P.kwargs
+    ) -> T:
+        allowed = Uses.declared(template.__signature__)
+        if allowed is None:
+            return fwd()  # no allow-list declared -> unrestricted
+
+        def _only_allowed(env, response_type, tools=frozenset(), anchor=None):
+            return fwd(
+                env,
+                response_type,
+                frozenset(t for t in tools if t in allowed),
+                anchor=anchor,
+            )
+
+        with handler({call_assistant: _only_allowed}):
+            return fwd()
