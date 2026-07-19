@@ -5,6 +5,7 @@ from typing import Annotated
 
 import pytest
 
+from effectful.internals.runtime import interpreter
 from effectful.ops.effects import (
     Computation,
     Requires,
@@ -15,7 +16,8 @@ from effectful.ops.effects import (
     effect_type,
     usesof,
 )
-from effectful.ops.syntax import Uses, defop
+from effectful.ops.semantics import apply
+from effectful.ops.syntax import Uses, defdata, defop
 from effectful.ops.types import NotHandled
 
 
@@ -186,6 +188,30 @@ def test_requires_is_per_argument_and_by_keyword():
     assert check_requires(move(src=read(), dst=read())) == {
         move: {"dst": frozenset({write})}
     }
+
+
+def test_check_requires_is_static_and_provenance_survives_real_impls():
+    # check_requires is a static structural check: it must NOT execute the program, and a
+    # producer op that has a real implementation must still be recognized as provenance
+    # (evaluating it would run its body and collapse the provenance term to a bare value).
+    ran = []
+
+    @defop
+    def source() -> int:
+        ran.append("source")  # a real side-effecting implementation
+        return 7
+
+    @defop
+    def sink(x: Annotated[int, Requires(source)]) -> None:
+        raise NotHandled
+
+    with interpreter({apply: defdata}):  # reify without executing
+        term = sink(source())
+
+    assert (
+        check_requires(term) == {}
+    )  # source provenance recognized despite its real impl
+    assert ran == []  # the check did not execute source (no side effect)
 
 
 def test_requires_absent_annotation_is_unconstrained():
