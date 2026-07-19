@@ -83,12 +83,9 @@ def toolsof(tool: Tool) -> frozenset[Tool]:
     stack: list[Tool] = [tool]
     while stack:
         cur = stack.pop()
-        context = getattr(
-            cur, "__context__", None
-        )  # only Templates capture lexical scope
-        if context is None:
-            continue
-        for sub in _tools_in_scope(context):
+        if not isinstance(cur, Template):
+            continue  # only a Template captures lexical scope; a plain Tool is a leaf
+        for sub in _tools_in_scope(cur.__context__):
             if sub not in seen:
                 seen.add(sub)
                 stack.append(sub)
@@ -131,24 +128,35 @@ def check_tools(fn: Callable[[], Any], *allowed: Tool) -> frozenset[Tool]:
 
 
 class RestrictTools(ObjectInterpretation):
-    """Off-by-default handler enforcing a template's ``Uses[...]`` allow-list at run time.
+    """Off-by-default handler enforcing a template's ``Uses[...]`` allow-list over its
+    **lexical tools** at run time.
 
     When a :class:`~effectful.handlers.llm.template.Template` whose return type declares
-    ``Uses[tool, ...]`` is called, the LLM is offered *only* the declared tools: the
-    lexical tools reaching :func:`~effectful.handlers.llm.completions.call_assistant` are
-    intersected with the allow-list. A template with no ``Uses`` annotation is unrestricted,
-    so installing this handler is backward-compatible.
+    ``Uses[tool, ...]`` is called, the real :class:`Tool` / :class:`Template` instances it
+    captured in lexical scope are intersected with the allow-list before being offered to
+    the LLM: the ``tools`` set reaching
+    :func:`~effectful.handlers.llm.completions.call_assistant` is filtered. A template with
+    no ``Uses`` annotation is unrestricted, so installing this handler is backward-compatible.
 
-    Enforcement is by construction and sound (no LLM introspection): an unlisted tool is
-    never *offered*, and the decode boundary rejects a call to a tool that was not offered,
-    so the model physically cannot invoke it. The restriction is scoped to the individual
-    ``Template.__apply__`` by a per-call handler on ``call_assistant`` — the effectful-native
-    pattern (a fresh handler whose dynamic extent is the call), so a template gets the
-    narrowed set only for its own completion.
+    **Guarantee (verified).** An unlisted *lexical tool* is provably never offered — it is
+    absent from the ``tools`` set at ``call_assistant`` and therefore from the model's
+    tool specs and the decode allow-list, so the model cannot invoke it. This holds even
+    alongside downstream ``call_assistant`` handlers that union tools back in
+    (``LexicalReaders``, ``SynthesizeAndCall``, ``PythonRepl``): those only add
+    handler-injected capabilities (synthetic readers, a final tool, a code-exec tool), not
+    the filtered-out real tools.
 
-    Only real lexical tools are filtered; handler-injected capabilities (synthetic readers,
-    a final tool, a code-exec tool) are ``tool_types`` unioned in downstream and are left
-    untouched.
+    **Scope (important).** This bounds the *real lexical tools only*, which is the effect
+    row ``Uses`` declares. It does **not** bound those handler-injected capabilities — they
+    are governed by whether their own handler is installed, not by this allow-list. In
+    particular, installing ``LexicalReaders`` alongside this handler still exposes in-scope
+    *values* as synthetic readers regardless of ``Uses``; for a hard boundary over lexical
+    values, do not also install ``LexicalReaders``. Governing readers/other capabilities by
+    the same allow-list is a separate, deferred feature.
+
+    The restriction is scoped to the individual ``Template.__apply__`` by a per-call handler
+    on ``call_assistant`` — the effectful-native pattern (a fresh handler whose dynamic
+    extent is the call), so a template gets the narrowed set only for its own completion.
     """
 
     @implements(Template.__apply__)

@@ -5,12 +5,13 @@ can reach — computed by reading captured lexical scope and by reifying to a Te
 running the LLM.
 """
 
+import contextlib
 from typing import Annotated
 
 from effectful.handlers.llm.completions import (
     LexicalReaders,
     LiteLLMProvider,
-    call_assistant,
+    completion,
 )
 from effectful.handlers.llm.governance import (
     RestrictTools,
@@ -24,28 +25,35 @@ from effectful.ops.semantics import apply, handler
 from effectful.ops.syntax import ObjectInterpretation, Uses, implements
 
 
-def _offered_tools(template, *args):
-    """The set of tools the LLM would be offered when ``template`` is called, captured at
-    the ``call_assistant`` seam and terminated before any model request (no LLM)."""
-    captured: set = set()
+class _StopBeforeRequest(Exception):
+    pass
 
-    class _Capture(ObjectInterpretation):
-        @implements(call_assistant)
-        def _ca(self, env, response_type, tools=frozenset(), **kw):
-            captured.update(tools)
-            return (
-                {},
-                [],
-                "done",
-            )  # terminate the completion loop, no completion() call
 
-    with (
-        handler(LiteLLMProvider(model="gpt-4o")),
-        handler(RestrictTools()),
-        handler(_Capture()),
-    ):
-        template(*args)
-    return captured
+def _model_tool_names(template, *extra_handlers):
+    """The tool *names* actually offered to the model when ``template`` is called under
+    ``RestrictTools`` (+ ``extra_handlers``), captured at the true boundary: the ``tools``
+    handed to :func:`~effectful.handlers.llm.completions.completion`. We intercept
+    ``completion`` and raise before any request, so no LLM is called — and, unlike a capture
+    at the outer ``call_assistant`` seam, this observes the *final* tool set after every
+    downstream handler (``LexicalReaders`` etc.) has unioned its capabilities in.
+    """
+    names: set[str] = set()
+
+    class _CaptureRequest(ObjectInterpretation):
+        @implements(completion)
+        def _c(self, *args, **kwargs):
+            names.update(t["function"]["name"] for t in kwargs.get("tools", []))
+            raise _StopBeforeRequest
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(handler(LiteLLMProvider(model="gpt-4o")))
+        stack.enter_context(handler(RestrictTools()))
+        for h in extra_handlers:
+            stack.enter_context(handler(h))
+        stack.enter_context(handler(_CaptureRequest()))
+        with contextlib.suppress(_StopBeforeRequest):
+            template()
+    return names
 
 
 def _trip_planner():
@@ -144,9 +152,10 @@ def test_tool_graph_counts_only_real_tools_not_handler_capabilities():
     )  # installing LexicalReaders does not change the graph
 
 
-def test_restrict_tools_enforces_the_uses_allowlist():
-    # L1: with RestrictTools installed, a template declaring `Uses[...]` offers the LLM
-    # ONLY the declared tools; the dangerous tool in scope is never presented.
+def test_restrict_tools_withholds_a_disallowed_lexical_tool_at_the_model_boundary():
+    # L1: a disallowed real lexical tool is provably never offered to the model, even
+    # alongside LexicalReaders (which unions capabilities into the tool set downstream of
+    # the filter). Asserted at the true boundary: the tools handed to `completion`.
     @Tool.define
     def cities() -> list[str]:
         """Cities."""
@@ -167,14 +176,17 @@ def test_restrict_tools_enforces_the_uses_allowlist():
         """Use cities and weather to suggest a city."""
         raise NotImplementedError
 
-    offered = _offered_tools(restricted)
-    assert offered == {cities, weather}  # exactly the allow-list
-    assert delete_everything not in offered  # the in-scope dangerous tool is withheld
+    # even with LexicalReaders installed (the handler that re-expands scope downstream):
+    names = _model_tool_names(restricted, LexicalReaders())
+    assert {"cities", "weather"} <= names  # the allow-listed tools are offered
+    assert (
+        "delete_everything" not in names
+    )  # the disallowed real tool is provably withheld
 
 
 def test_restrict_tools_leaves_unrestricted_templates_alone():
     # Backward-compatible: a template with no `Uses` annotation is unrestricted, so every
-    # lexically-captured tool is still offered even with RestrictTools installed.
+    # lexically-captured tool still reaches the model even with RestrictTools installed.
     @Tool.define
     def cities() -> list[str]:
         """Cities."""
@@ -190,11 +202,11 @@ def test_restrict_tools_leaves_unrestricted_templates_alone():
         """Suggest a city."""
         raise NotImplementedError
 
-    offered = _offered_tools(unrestricted)
+    names = _model_tool_names(unrestricted)
     assert {
-        cities,
-        delete_everything,
-    } <= offered  # full lexical capture, nothing withheld
+        "cities",
+        "delete_everything",
+    } <= names  # nothing withheld without a Uses row
 
 
 def test_check_tools_flags_the_leak():
