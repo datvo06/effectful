@@ -34,6 +34,8 @@ not effectful tools), a decode-time ``ε`` validator, and ``tool_choice`` forcin
 module is the ``ε`` core (fold + argument annotations).
 """
 
+import collections.abc
+import dataclasses
 import typing
 from dataclasses import dataclass
 from typing import Annotated, Any
@@ -187,9 +189,11 @@ def check_requires(term: Expr[Any]) -> dict[Operation, dict[str, frozenset[Opera
     against its *unevaluated argument subterms* (an argument satisfies ``Requires(op)`` iff
     ``op`` is in that subterm's :func:`usesof` row). It does not execute the program — a
     provenance check must not run the very effects it is guarding, and evaluating an
-    argument would collapse its provenance term to a bare value. (Provenance carried through
-    ``Operation`` subclasses that override ``__apply__`` is not tracked, matching
-    :func:`usesof`.)"""
+    argument would collapse its provenance term to a bare value. Recursion descends through
+    the same containers :func:`~effectful.ops.semantics.evaluate` traverses (sequences,
+    mappings, dataclass fields), so a node nested inside a ``list`` of results or a
+    dataclass field is still reached. (Provenance carried through ``Operation`` subclasses
+    that override ``__apply__`` is not tracked, matching :func:`usesof`.)"""
     violations: dict[Operation, dict[str, frozenset[Operation]]] = {}
 
     def walk(x: Any) -> None:
@@ -200,6 +204,18 @@ def check_requires(term: Expr[Any]) -> dict[Operation, dict[str, frozenset[Opera
                 walk(a)
             for v in x.kwargs.values():
                 walk(v)
+        elif isinstance(x, collections.abc.Mapping):
+            for k, v in x.items():
+                walk(k)
+                walk(v)
+        elif isinstance(x, (list, tuple, set, frozenset)) and not isinstance(
+            x, (str, bytes)
+        ):
+            for e in x:
+                walk(e)
+        elif dataclasses.is_dataclass(x) and not isinstance(x, type):
+            for f in dataclasses.fields(x):
+                walk(getattr(x, f.name))
 
     walk(term)
     return violations

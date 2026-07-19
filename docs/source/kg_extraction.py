@@ -95,27 +95,41 @@ def check_grounded(
 
 
 if __name__ == "__main__":
-    document = "Paris is the capital of France."
+    document = "Paris is the capital of France. Marie Curie was born in Warsaw."
 
+    # A real extraction returns a *list* of triples (and each Triple/Span is a dataclass),
+    # so the check must reach violations nested inside those containers.
     def grounded():
-        # both endpoints are spans found in the document -> provenance holds
-        return make_triple(
-            find_span(document, "Paris"),
-            "capital_of",
-            find_span(document, "France"),
-        )
+        return [
+            make_triple(
+                find_span(document, "Paris"),
+                "capital_of",
+                find_span(document, "France"),
+            ),
+            make_triple(
+                find_span(document, "Marie Curie"),
+                "born_in",
+                find_span(document, "Warsaw"),
+            ),
+        ]
 
     def hallucinated():
-        # the object is a span the model invented, not one it found -> provenance fails
-        return make_triple(
-            find_span(document, "Paris"),
-            "capital_of",
-            Span("Atlantis", 0, 8),
-        )
+        # the second triple's object is a span the model invented, not one it found
+        return [
+            make_triple(
+                find_span(document, "Paris"),
+                "capital_of",
+                find_span(document, "France"),
+            ),
+            make_triple(
+                find_span(document, "Marie Curie"), "born_in", Span("Atlantis", 0, 8)
+            ),
+        ]
 
     print("grounded:    ", check_grounded(grounded) or "OK — every triple is grounded")
     print("hallucinated:", check_grounded(hallucinated) or "OK")
     # Only run an extraction once its provenance is verified:
     assert not check_grounded(grounded)
+    assert check_grounded(hallucinated)  # the buried hallucination is caught
     with interpreter({apply: lambda op, *a, **k: op.__default_rule__(*a, **k)}):
         print("result:      ", grounded())

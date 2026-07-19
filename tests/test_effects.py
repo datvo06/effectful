@@ -1,5 +1,6 @@
 """The effect-row engine (``ε``): ``usesof`` / ``Uses`` / ``Computation`` / ``Requires``."""
 
+import dataclasses
 from collections.abc import Callable
 from typing import Annotated
 
@@ -212,6 +213,31 @@ def test_check_requires_is_static_and_provenance_survives_real_impls():
         check_requires(term) == {}
     )  # source provenance recognized despite its real impl
     assert ran == []  # the check did not execute source (no side effect)
+
+
+def test_check_requires_reaches_violations_nested_in_containers():
+    # A provenance violation nested inside a list / dict value / dataclass field must still
+    # be reported: an extraction naturally returns a *list* of results, and results are
+    # dataclasses. The walk descends the same containers usesof/evaluate traverse.
+    @defop
+    def source() -> int:
+        raise NotHandled
+
+    @defop
+    def needs(x: Annotated[int, Requires(source)]) -> int:
+        raise NotHandled
+
+    @dataclasses.dataclass(frozen=True)
+    class Box:
+        item: object
+
+    flagged = {needs: {"x": frozenset({source})}}
+    with interpreter({apply: defdata}):
+        assert check_requires([needs(1)]) == flagged  # nested in a list
+        assert check_requires({"k": needs(1)}) == flagged  # nested in a dict value
+        assert check_requires(Box(needs(1))) == flagged  # nested in a dataclass field
+        # a grounded one nested the same way is NOT flagged (the walk is not always-firing)
+        assert check_requires([needs(source())]) == {}
 
 
 def test_requires_absent_annotation_is_unconstrained():
