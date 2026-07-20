@@ -31,14 +31,27 @@ import collections.abc
 from collections.abc import Callable
 from typing import Any
 
-from effectful.handlers.llm.completions import _tools_in_scope, call_assistant
-from effectful.handlers.llm.template import Template, Tool
+from effectful.handlers.llm.completions import (
+    ToolCallExecutionError,
+    _tools_in_scope,
+    call_assistant,
+    call_tool,
+)
+from effectful.handlers.llm.encoding import DecodedToolCall
+from effectful.handlers.llm.template import FinalTool, Template, Tool
 from effectful.internals.runtime import interpreter
+from effectful.ops.effects import check_requires
 from effectful.ops.semantics import apply, fwd, handler
 from effectful.ops.syntax import ObjectInterpretation, Uses, defdata, implements
 from effectful.ops.types import Term
 
-__all__ = ["toolsof", "reachable_tools", "check_tools", "RestrictTools"]
+__all__ = [
+    "toolsof",
+    "reachable_tools",
+    "check_tools",
+    "RestrictTools",
+    "CheckProvenance",
+]
 
 
 def _tools_in(term: Any) -> frozenset[Tool]:
@@ -177,3 +190,61 @@ class RestrictTools(ObjectInterpretation):
 
         with handler({call_assistant: _only_allowed}):
             return fwd()
+
+
+def _ungrounded_message(
+    violations: dict[Any, dict[str, frozenset]],
+) -> str:
+    """A retry-feedback message naming each ungrounded argument and the operation that must
+    have produced it."""
+    parts = []
+    for op, unmet in violations.items():
+        for arg, missing in unmet.items():
+            need = " / ".join(sorted(o.__name__ for o in missing))
+            parts.append(
+                f"argument {arg!r} of {op.__name__}() must be a value produced by "
+                f"{need}(), not one constructed directly"
+            )
+    return (
+        "Ungrounded value(s) in your answer: "
+        + "; ".join(parts)
+        + ". Rebuild those values by calling the required operation(s)."
+    )
+
+
+class CheckProvenance(ObjectInterpretation):
+    """Off-by-default handler that provenance-checks a *synthesized* final answer before it
+    is accepted, enforcing ``Requires`` refinement types on the code an LLM writes.
+
+    Compose it with ``SynthesizeAndCall`` (and ``RetryLLMHandler``): when the model answers
+    by calling the finalizing tool with a function it wrote, this handler reifies that
+    function to a term — running its operations symbolically under ``defdata`` rather than
+    executing them — and folds it with :func:`~effectful.ops.effects.check_requires`. If the
+    function would build a value that violates a ``Requires`` precondition (for example a
+    knowledge-graph triple from a span the model *invented* rather than *found*), the
+    finalizing call is rejected with a :class:`ToolCallExecutionError` describing the
+    ungrounded argument. ``RetryLLMHandler`` feeds that back and the model revises, so the
+    answer only stands once its provenance holds — with no ground-truth labels and no
+    trusting the model's own claim.
+
+    This is sound because the check reads a *term* (the synthesized program), not the eager
+    values the model reports. It assumes the synthesized function is straight-line over its
+    operations (it passes found values to operations rather than inspecting them) — the same
+    reifiability precondition as :func:`reachable_tools`.
+    """
+
+    @implements(call_tool)
+    def _check_provenance[T](self, tool_call: DecodedToolCall[T]):
+        if isinstance(tool_call.tool, FinalTool):
+            # Reify the finalizing application (implementation applied to the inputs): its
+            # operations become term nodes instead of executing, so provenance is preserved.
+            with interpreter({apply: defdata}):
+                term = tool_call.tool.__default__(
+                    *tool_call.bound_args.args, **tool_call.bound_args.kwargs
+                )
+            if violations := check_requires(term):
+                raise ToolCallExecutionError(
+                    raw_tool_call=tool_call,
+                    original_error=ValueError(_ungrounded_message(violations)),
+                )
+        return fwd()

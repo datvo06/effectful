@@ -6,14 +6,22 @@ running the LLM.
 """
 
 import contextlib
+import dataclasses
 from typing import Annotated
+
+import pytest
 
 from effectful.handlers.llm.completions import (
     LexicalReaders,
     LiteLLMProvider,
+    SynthesizeAndCall,
+    ToolCallExecutionError,
+    call_tool,
     completion,
 )
+from effectful.handlers.llm.encoding import DecodedToolCall
 from effectful.handlers.llm.governance import (
+    CheckProvenance,
     RestrictTools,
     check_tools,
     reachable_tools,
@@ -21,8 +29,10 @@ from effectful.handlers.llm.governance import (
 )
 from effectful.handlers.llm.template import Template, Tool
 from effectful.internals.runtime import interpreter
+from effectful.ops.effects import Requires
 from effectful.ops.semantics import apply, handler
 from effectful.ops.syntax import ObjectInterpretation, Uses, implements
+from effectful.ops.types import NotHandled
 
 
 class _StopBeforeRequest(Exception):
@@ -240,3 +250,88 @@ def test_reachable_tools_ignores_ambient_apply_handler():
     assert delete_everything in under_ambient
     # reification isolated the tool calls — none of the trip tools executed concretely
     assert not ({suggest_city, delete_everything} & set(ran))
+
+
+def _extraction_final_tool():
+    """Build the #664 extraction ops, an `extract` template, and the real synthesis final
+    tool (`submit_solution`) whose argument is the LLM's synthesized implementation."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Span:
+        text: str
+        start: int
+        end: int
+
+    @dataclasses.dataclass(frozen=True)
+    class Triple:
+        subject: Span
+        relation: str
+        object: Span
+
+    from effectful.ops.syntax import defop
+
+    @defop
+    def find_span(document: str, query: str) -> Span:
+        i = document.find(query)
+        return Span(query, i, i + len(query))
+
+    @defop
+    def make_triple(
+        subject: Annotated[Span, Requires(find_span)],
+        relation: str,
+        object: Annotated[Span, Requires(find_span)],
+    ) -> Triple:
+        return Triple(subject, relation, object)
+
+    @Template.define
+    def extract(document: str) -> list[Triple]:
+        """Extract triples, grounding every span with find_span."""
+        raise NotHandled
+
+    bound = extract.__signature__.bind("Paris is the capital of France.")
+    bound.apply_defaults()
+    tool = SynthesizeAndCall._SynthesisFinalTool.define(extract, bound)
+    return tool, find_span, make_triple, Span
+
+
+def _tool_call(tool, implementation):
+    bound = tool.__signature__.bind(implementation)
+    bound.apply_defaults()
+    return DecodedToolCall(tool=tool, bound_args=bound, id="test-call", name=tool.__name__)
+
+
+def test_check_provenance_rejects_a_synthesized_answer_that_hallucinates():
+    # CheckProvenance provenance-checks the *synthesized* answer with no LLM: a grounded
+    # implementation passes through to the real call_tool; a hallucinated one (a triple
+    # built from an invented span) is rejected with a retryable ToolCallExecutionError.
+    tool, find_span, make_triple, Span = _extraction_final_tool()
+
+    def grounded(document):
+        return [
+            make_triple(
+                find_span(document, "Paris"), "capital_of", find_span(document, "France")
+            )
+        ]
+
+    def hallucinated(document):
+        return [
+            make_triple(find_span(document, "Paris"), "capital_of", Span("Atlantis", 0, 8))
+        ]
+
+    reached = []
+
+    class _StubCallTool(ObjectInterpretation):
+        @implements(call_tool)
+        def _ct(self, tool_call):
+            reached.append(tool_call)
+            return ({}, None, True)  # stand in for the real (message, result, is_final)
+
+    with handler(_StubCallTool()), handler(CheckProvenance()):
+        call_tool(_tool_call(tool, grounded))  # provenance holds -> forwarded
+        assert len(reached) == 1  # the grounded answer reached the real call_tool
+
+        with pytest.raises(ToolCallExecutionError) as exc:
+            call_tool(_tool_call(tool, hallucinated))  # invented span -> rejected
+        assert len(reached) == 1  # the hallucinated answer did NOT reach call_tool
+    # the rejection names the ungrounded argument so the model can revise
+    assert "find_span" in str(exc.value.original_error)
