@@ -22,9 +22,37 @@ straight-line over its operations (the same reifiability precondition as ``reach
 
 Run it (needs an API key for the chosen model)::
 
-    python -m docs.source.kg_extraction_llm --model anthropic/claude-3-5-sonnet-20241022
+    uv run python docs/source/kg_extraction_llm.py --model gpt-4o
 
-The provenance check itself is model-agnostic and is verified without any LLM in
+## Example run
+
+A real ``gpt-4o`` run on "Marie Curie was born in Warsaw. Paris is the capital of France.":
+the model *answers by writing code*, which ``CheckProvenance`` accepts because every span is
+found in the document::
+
+    → submit_solution
+    def extract(document: str) -> list[Triple]:
+        subject1 = find_span(document, 'Marie Curie')
+        object1  = find_span(document, 'Warsaw')
+        triple1  = make_triple(subject1, 'was born in', object1)
+        subject2 = find_span(document, 'Paris')
+        object2  = find_span(document, 'France')
+        triple2  = make_triple(subject2, 'is the capital of', object2)
+        return [triple1, triple2]
+
+    Extracted 2 grounded triple(s):
+      (Marie Curie) --was born in--> (Warsaw)
+      (Paris) --is the capital of--> (France)
+
+When the model instead builds a triple from a span it *invented* (e.g. ``Span("Poland")`` for
+a country not written in the text), ``CheckProvenance`` rejects the answer and the message is
+fed back for revision::
+
+    Ungrounded value(s) in your answer: argument 'object' of make_triple() must be a value
+    produced by find_span(), not one constructed directly. Rebuild those values by calling
+    the required operation(s).
+
+The provenance check is model-agnostic and is verified without any LLM in
 ``tests/test_handlers_llm_governance.py::test_check_provenance_rejects_a_synthesized_answer_that_hallucinates``.
 """
 
